@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dit-chatbot
+    env: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python3 backend/app.py
+    envVars:
+      - key: FLASK_HOST
+        value: 0.0.0.0
+      - key: FLASK_PORT
+        value: 5000
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: EMBEDDING_MODEL
+        value: all-MiniLM-L6-v2

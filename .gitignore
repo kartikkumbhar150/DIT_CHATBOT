@@ -1,0 +1,10 @@
+# Ignore environment variables
+backend/.env
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore data files
+backend/data
+backend/venv
