@@ -1,3 +1,4 @@
+#embeddings_indexer.py
 import os
 import glob
 import json
@@ -8,54 +9,64 @@ import hashlib
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from huggingface_hub import hf_hub_download
 
 import numpy as np
 from tqdm import tqdm
 import faiss
 
-# ---- Load ENV ----
+# ------------------------------------------------------
+# Hugging Face repo settings
+# ------------------------------------------------------
+HF_REPO     = "kumbharkartik15/DIT_College_ChatBot"
+HF_REVISION = "main"   # or a commit hash/tag for pinning
+
+def download_from_hf(filename: str) -> str:
+    """
+    Download a file from the Hugging Face dataset repo and return the
+    path in the local HF cache.
+    """
+    return hf_hub_download(repo_id=HF_REPO, filename=filename, revision=HF_REVISION)
+
+# ------------------------------------------------------
+# Environment / defaults
+# ------------------------------------------------------
 load_dotenv()
 
-# ---- Paths / defaults ----
 BASE = os.path.dirname(__file__)
-DATA_DIR = os.path.join(BASE, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
+CACHE_DIR = os.path.join(BASE, "data")       # local cache if you rebuild
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-TEXT_FILE = os.path.join(DATA_DIR, "college.txt")
-CHUNKS_FILE = os.path.join(DATA_DIR, "docs_chunks.json")
-FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_index.bin")
-FAISS_META_FILE = os.path.join(DATA_DIR, "faiss_meta.pkl")
+TEXT_FILE = os.path.join(CACHE_DIR, "college.txt")
+CHUNKS_FILE = os.path.join(CACHE_DIR, "docs_chunks.json")
+FAISS_INDEX_FILE = os.path.join(CACHE_DIR, "faiss_index.bin")
+FAISS_META_FILE = os.path.join(CACHE_DIR, "faiss_meta.pkl")
 
-# ---- Models & hyperparams ----
-EMBED_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
-QA_EMBED_MODEL_NAME = os.getenv("QA_EMBEDDING_MODEL", "intfloat/e5-base-v2")
-CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2")
+EMBED_MODEL_NAME   = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
+QA_EMBED_MODEL     = os.getenv("QA_EMBEDDING_MODEL", "intfloat/e5-base-v2")
+CROSS_ENCODER_MODEL= os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2")
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "300"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "30"))
-MIN_CHUNK_WORDS = int(os.getenv("MIN_CHUNK_WORDS", "20"))
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "300"))
+CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "30"))
+MIN_CHUNK_WORDS= int(os.getenv("MIN_CHUNK_WORDS", "20"))
 
-HNSW_M = int(os.getenv("HNSW_M", "32"))
-EF_CONSTRUCTION = int(os.getenv("EF_CONSTRUCTION", "200"))
-EF_SEARCH = int(os.getenv("EF_SEARCH", "50"))
+HNSW_M         = int(os.getenv("HNSW_M", "32"))
+EF_CONSTRUCTION= int(os.getenv("EF_CONSTRUCTION", "200"))
+EF_SEARCH      = int(os.getenv("EF_SEARCH", "50"))
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "64"))
 
-# =====================================================
-#               STREAMING HELPERS
-# =====================================================
-
+# ------------------------------------------------------
+# Helpers: chunking
+# ------------------------------------------------------
 def is_heading(text: str) -> bool:
-    """Detect if a line looks like a heading (heuristic)."""
     t = text.strip()
     return (
-        (len(t) < 120 and (t.endswith(":") or t.isupper())) or
-        re.match(r'^[\d\.\sA-Z\-]{1,60}$', t) is not None
+        (len(t) < 120 and (t.endswith(":") or t.isupper()))
+        or re.match(r"^[\d\.\sA-Z\-]{1,60}$", t) is not None
     )
 
-
 def stream_file_paragraphs(fp: str):
-    """Yield paragraphs from file without loading entire file."""
     buf = []
     with open(fp, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -73,20 +84,14 @@ def stream_file_paragraphs(fp: str):
             if para:
                 yield para
 
-
-def stream_chunks_from_file(
-    fp: str,
-    chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP
-) -> List[Dict[str, Any]]:
-    """Read file → paragraphs → chunks directly."""
+def stream_chunks_from_file(fp: str,
+                            chunk_size: int = CHUNK_SIZE,
+                            overlap: int = CHUNK_OVERLAP) -> List[Dict[str, Any]]:
     chunks, cur_words, cur_len, last_heading = [], [], 0, None
-
     for para in stream_file_paragraphs(fp):
         if is_heading(para):
             last_heading = para
             continue
-
         sentences = re.split(r'(?<=[.!?])\s+', para)
         for sent in sentences:
             words = sent.split()
@@ -116,46 +121,40 @@ def stream_chunks_from_file(
             uniq.append(c)
     return uniq
 
-# =====================================================
-#               INDEX BUILD / LOAD / SEARCH
-# =====================================================
-
-def build_index(
-    embedding_model_name: str = EMBED_MODEL_NAME,
-    use_qa_model: bool = False
-):
+# ------------------------------------------------------
+# Index build
+# ------------------------------------------------------
+def build_index(embedding_model_name: str = EMBED_MODEL_NAME,
+                use_qa_model: bool = False):
     print("Reading + chunking files...")
     if os.path.exists(TEXT_FILE):
         files = [TEXT_FILE]
     else:
         files = []
         for pattern in ("*.txt", "*.md", "*.html"):
-            files.extend(glob.glob(os.path.join(DATA_DIR, pattern)))
+            files.extend(glob.glob(os.path.join(CACHE_DIR, pattern)))
     if not files:
-        raise FileNotFoundError(f"No source files found in {DATA_DIR}")
+        raise FileNotFoundError(f"No source files found in {CACHE_DIR}")
 
     all_chunks = []
     for fp in sorted(files):
         file_chunks = stream_chunks_from_file(fp)
         for ch in file_chunks:
             all_chunks.append({"source": os.path.basename(fp), **ch})
-
     if not all_chunks:
         raise RuntimeError("No chunks produced. Check your input files.")
 
     print(f"Total chunks: {len(all_chunks)}")
-
-    # ---- Embeddings ----
-    model_name = QA_EMBED_MODEL_NAME if use_qa_model else embedding_model_name
+    model_name = QA_EMBED_MODEL if use_qa_model else embedding_model_name
     print(f"Loading embedding model: {model_name}")
     embedder = SentenceTransformer(model_name)
-    print(f" Embedding dim: {embedder.get_sentence_embedding_dimension()}")
+    dim = embedder.get_sentence_embedding_dimension()
 
     embeddings = []
     texts = [c["text"] for c in all_chunks]
     for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Encoding"):
         embs = embedder.encode(
-            texts[i:i + BATCH_SIZE],
+            texts[i:i+BATCH_SIZE],
             show_progress_bar=False,
             convert_to_numpy=True,
             batch_size=BATCH_SIZE
@@ -164,7 +163,6 @@ def build_index(
     arr = np.vstack(embeddings).astype("float32")
     faiss.normalize_L2(arr)
 
-    dim = arr.shape[1]
     print(f"Creating HNSW FAISS index (dim={dim}, M={HNSW_M})")
     index = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = EF_CONSTRUCTION
@@ -174,23 +172,28 @@ def build_index(
     ids = np.arange(len(all_chunks)).astype("int64")
     index_id_map.add_with_ids(arr, ids)
 
-    print("Saving index + metadata...")
+    print("Saving index + metadata to local cache...")
     faiss.write_index(index_id_map, FAISS_INDEX_FILE)
     with open(FAISS_META_FILE, "wb") as f:
         pickle.dump(all_chunks, f)
     with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, ensure_ascii=False, indent=2)
-
     print("Index build complete.")
 
-
-def load_index_and_meta(
-    embed_model_name: str = EMBED_MODEL_NAME,
-    index_path: str = FAISS_INDEX_FILE,
-    meta_path: str = FAISS_META_FILE
-):
-    if not os.path.exists(index_path) or not os.path.exists(meta_path):
-        raise FileNotFoundError("Index or metadata not found. Run with --build first.")
+# ------------------------------------------------------
+# Load (from HF by default)
+# ------------------------------------------------------
+def load_index_and_meta(embed_model_name: str = EMBED_MODEL_NAME,
+                        index_path: Optional[str] = None,
+                        meta_path: Optional[str]  = None):
+    """
+    Load FAISS index and metadata.
+    If no local path is supplied, download from Hugging Face repo.
+    """
+    if index_path is None:
+        index_path = download_from_hf("faiss_index.bin")
+    if meta_path is None:
+        meta_path  = download_from_hf("faiss_meta.pkl")
 
     print("Loading FAISS index + metadata...")
     index = faiss.read_index(index_path)
@@ -199,18 +202,16 @@ def load_index_and_meta(
 
     embedder = SentenceTransformer(embed_model_name)
     model_dim = embedder.get_sentence_embedding_dimension()
-    index_dim = index.d
-    print(f"ℹ Model dim={model_dim}, Index dim={index_dim}")
-
-    if model_dim != index_dim:
+    if model_dim != index.d:
         raise ValueError(
-            f"Dimension mismatch! Model={model_dim}, Index={index_dim}. "
-            f"Rebuild the index with this model."
+            f"Dimension mismatch! Model={model_dim}, Index={index.d}. "
+            "Rebuild the index with this model."
         )
-
     return index, meta, embedder
 
-
+# ------------------------------------------------------
+# Search
+# ------------------------------------------------------
 _cross_encoder = None
 def get_cross_encoder(model_name: str = CROSS_ENCODER_MODEL):
     global _cross_encoder
@@ -219,14 +220,11 @@ def get_cross_encoder(model_name: str = CROSS_ENCODER_MODEL):
         _cross_encoder = CrossEncoder(model_name)
     return _cross_encoder
 
-
-def search(
-    query: str,
-    top_k: int = 5,
-    rerank: bool = True,
-    embed_model_name: str = EMBED_MODEL_NAME,
-    cross_encoder_model: Optional[str] = CROSS_ENCODER_MODEL
-):
+def search(query: str,
+           top_k: int = 5,
+           rerank: bool = True,
+           embed_model_name: str = EMBED_MODEL_NAME,
+           cross_encoder_model: Optional[str] = CROSS_ENCODER_MODEL):
     index, meta, embedder = load_index_and_meta(embed_model_name)
     qv = embedder.encode(query, convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(qv)
@@ -244,25 +242,25 @@ def search(
             rerank_scores = cross.predict(pairs)
             for c, new_sc in zip(candidates, rerank_scores):
                 c["rerank_score"] = float(new_sc)
-            candidates = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+            candidates = sorted(candidates,
+                                key=lambda x: x["rerank_score"],
+                                reverse=True)
         except Exception as e:
             print(f"Cross-encoder rerank failed: {e}")
 
     return candidates
 
-
-# =====================================================
-#                   CLI
-# =====================================================
-
+# ------------------------------------------------------
+# CLI
+# ------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="FAISS chatbot indexer + search")
-    parser.add_argument("--build", action="store_true", help="Build embeddings + FAISS index")
-    parser.add_argument("--use_qa_model", action="store_true", help="Use QA-optimized embedding model")
-    parser.add_argument("--search", type=str, help="Run a quick search query")
-    parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--no_rerank", action="store_true")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="FAISS chatbot indexer + search (HF-ready)")
+    p.add_argument("--build", action="store_true", help="Build embeddings + FAISS index (local)")
+    p.add_argument("--use_qa_model", action="store_true", help="Use QA-optimized embedding model")
+    p.add_argument("--search", type=str, help="Run a quick search query")
+    p.add_argument("--top_k", type=int, default=5)
+    p.add_argument("--no_rerank", action="store_true")
+    args = p.parse_args()
 
     if args.build:
         build_index(use_qa_model=args.use_qa_model)
@@ -277,8 +275,7 @@ def main():
             print(meta.get("text", "")[:300], "...")
         return
 
-    parser.print_help()
-
+    p.print_help()
 
 if __name__ == "__main__":
     main()
