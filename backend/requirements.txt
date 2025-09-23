@@ -8,3 +8,4 @@ numpy
 python-dotenv
 sentence-transformers
 tqdm
+gunicorn

@@ -305,8 +305,16 @@ def static_proxy(path):
 
 
 if __name__ == "__main__":
+    import os
+
+    # Host stays 0.0.0.0 for external access
     host = os.getenv("FLASK_HOST", "0.0.0.0")
+
+    # Local dev port defaults to 5000 or FLASK_PORT if set
     port = int(os.getenv("FLASK_PORT", 5000))
+
+    # Only enable debug locally
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    print(f"Running Flask server on http://{host}:{port}")
+
+    print(f"Running Flask server locally on http://{host}:{port} (debug={debug})")
     app.run(host=host, port=port, debug=debug)
