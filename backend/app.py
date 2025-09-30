@@ -67,8 +67,10 @@ faiss_index, metadata, embed_model = load_index_and_meta(
 )
 print(f"FAISS index loaded with {len(metadata)} entries")
 
-# Shared embedding model for JSON Q&A
-shared_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Removed: shared_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Optimization: Reuse the 'embed_model' instance for JSON Q&A and Cutoff searches.
+# This prevents loading a second copy of the model into memory.
+shared_model = embed_model # <<<--- MEMORY OPTIMIZATION
 
 qa_embeddings = shared_model.encode(questions, convert_to_numpy=True).astype("float32")
 faiss.normalize_L2(qa_embeddings)
@@ -164,6 +166,7 @@ def search_cutoff_embeddings(query: str, top_k: int = 10, threshold: float = 0.3
 # ================== Retrieval (Main RAG) ==================
 @lru_cache(maxsize=256)
 def embed_query_cached(query: str) -> np.ndarray:
+    # embed_model is used here for the main RAG, as before.
     return embed_model.encode([query], convert_to_numpy=True).astype("float32")
 
 
