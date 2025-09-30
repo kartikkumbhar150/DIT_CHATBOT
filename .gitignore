@@ -8,3 +8,7 @@ __pycache__/
 # Ignore data files
 backend/data
 backend/venv
+
+backend/docker-compose.yaml
+backend/Dockerfile
+

@@ -57,6 +57,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ================== Load FAISS ==================
+# Note: embeddings_indexer.py must be available in the environment
 from embeddings_indexer import load_index_and_meta
 
 # ✅ Use correct argument names (index_path/meta_path)
@@ -111,6 +112,7 @@ def search_cutoff_embeddings(query: str, top_k: int = 10, threshold: float = 0.3
     for idx, score in zip(I[0], D[0]):
         if idx < 0 or score < threshold:
             continue
+        # In this specific setup, the cutoff documents are pre-formatted strings
         results.append(cutoff_documents[idx])
 
     if not results:
@@ -120,17 +122,28 @@ def search_cutoff_embeddings(query: str, top_k: int = 10, threshold: float = 0.3
     categories = ["open", "obc", "sc", "st", "ews", "nt", "sebc", "pwd", "def", "orphan", "tfws"]
     target_category = next((c for c in categories if c in query_lower), None)
 
-    top_branch = results[0].split(", ")[0].split(": ")[1]
+    # Get the branch from the top result
+    try:
+        top_result_parts = results[0].split(", ")
+        top_branch = next(part.split(": ")[1] for part in top_result_parts if part.startswith("Branch: "))
+    except (StopIteration, IndexError):
+        top_branch = "Unknown Branch"
+
+    # Filter documents based on the top branch and, optionally, the target category
     grouped = []
     for r in cutoff_documents:
         parts = r.split(", ")
-        branch = parts[0].split(": ")[1]
-        category = parts[2].split(": ")[1]
-        cutoff_rank = parts[3].split(": ")[1]
-        percentile = parts[4].split(": ")[1]
+        try:
+            branch = next(part.split(": ")[1] for part in parts if part.startswith("Branch: "))
+            category = next(part.split(": ")[1] for part in parts if part.startswith("Category: "))
+            cutoff_rank = next(part.split(": ")[1] for part in parts if part.startswith("Cutoff Rank: "))
+            percentile = next(part.split(": ")[1] for part in parts if part.startswith("Percentile: "))
+        except (StopIteration, IndexError):
+            continue # Skip malformed entries
 
         if branch == top_branch:
             if target_category:
+                # Check if the target category is part of the document's category string
                 if target_category in category.lower():
                     grouped.append((category, cutoff_rank, percentile))
             else:
@@ -148,7 +161,7 @@ def search_cutoff_embeddings(query: str, top_k: int = 10, threshold: float = 0.3
     return md_table
 
 
-# ================== Retrieval ==================
+# ================== Retrieval (Main RAG) ==================
 @lru_cache(maxsize=256)
 def embed_query_cached(query: str) -> np.ndarray:
     return embed_model.encode([query], convert_to_numpy=True).astype("float32")
@@ -175,10 +188,21 @@ def retrieve(query: str, top_k: int = 3):
 # ================== Async Runner ==================
 def run_async(coro):
     try:
+        # Attempt to get the existing loop
         loop = asyncio.get_event_loop()
+        # If the loop is closed or stopped, create a new one
+        if loop.is_running():
+            # If running, we might be inside another async function, run the coro directly
+            # This is complex in a non-async web framework; sticking to run_until_complete is safer for Flask.
+            pass
+        elif loop.is_closed():
+             loop = asyncio.new_event_loop()
+             asyncio.set_event_loop(loop)
     except RuntimeError:
+        # No current event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        
     return loop.run_until_complete(coro)
 
 
@@ -189,7 +213,10 @@ MAX_PROMPT_CHARS = 7000
 
 
 def truncate_text(text: str, max_chars: int) -> str:
-    return text[:max_chars] + ("..." if len(text) > max_chars else "")
+    """Safely truncate text for context window management."""
+    if len(text) > max_chars:
+        return text[:max_chars - 3] + "..."
+    return text
 
 
 def build_prompt(question, retrieved_docs, history):
@@ -200,23 +227,35 @@ def build_prompt(question, retrieved_docs, history):
         "- Ignore unrelated queries.\n"
     )
 
-    hist_text = ""
+    hist_text = "Conversation History:\n" if history else ""
     if history:
-        for h in history[-3:]:
-            q_text = truncate_text(h.get("q", ""), MAX_HISTORY_CHARS // 2)
-            a_text = truncate_text(h.get("a", ""), MAX_HISTORY_CHARS // 2)
+        # Use a maximum of the last 3 turns
+        history_to_use = history[-3:]
+        
+        # Calculate available chars for history after saving some space for context and query
+        available_history_chars = MAX_HISTORY_CHARS 
+        
+        for h in history_to_use:
+            q_text = truncate_text(h.get("q", ""), available_history_chars // (2 * len(history_to_use)))
+            a_text = truncate_text(h.get("a", ""), available_history_chars // (2 * len(history_to_use)))
             hist_text += f"Q: {q_text}\nA: {a_text}\n"
 
-    sources_text = "\n\n".join([truncate_text(d["text"], MAX_DOC_CHARS) for d in retrieved_docs[:3]])
+    # Collect the text from the retrieved documents
+    sources_text = "\n\n".join([truncate_text(d["text"], MAX_DOC_CHARS // len(retrieved_docs)) for d in retrieved_docs[:3]])
 
     user_prompt = (
-        f"{hist_text}\nQuestion: {truncate_text(question, MAX_DOC_CHARS)}\n\n"
+        f"{hist_text}\n"
         f"Context documents:\n{sources_text}\n\n"
-        "Answer with the shortest and most precise response possible."
+        f"Question: {truncate_text(question, MAX_DOC_CHARS)}\n\n"
+        "Answer with the shortest and most precise response possible based *only* on the provided context, history, or your college knowledge base."
     )
 
-    if len(user_prompt) > MAX_PROMPT_CHARS:
-        user_prompt = truncate_text(user_prompt, MAX_PROMPT_CHARS)
+    # Final check on total prompt length before sending
+    total_prompt = f"System: {system}\nUser: {user_prompt}"
+    if len(total_prompt) > MAX_PROMPT_CHARS:
+        # If it's too long, prioritize keeping the question and context, heavily truncating history if needed.
+        # However, truncating the user_prompt built from components is the best we can do here.
+        user_prompt = truncate_text(user_prompt, MAX_PROMPT_CHARS - len(system) - 100) # -100 for safety
 
     return system, user_prompt
 
@@ -232,6 +271,8 @@ def api_query():
         return jsonify({"error": "No query provided"}), 400
 
     q_lower = q.lower()
+    
+    # --- Control Commands ---
     if q_lower in {"stop", "exit", "okay stop", "ok stop", "wait"}:
         return jsonify({"answer": "[stopped]", "retrieved": [], "history": HISTORY.get(session_id, [])})
 
@@ -240,15 +281,17 @@ def api_query():
         gc.collect()
         return jsonify({"answer": "History cleared.", "retrieved": [], "history": []})
 
-    admission_keywords = {"cutoff", "cut off", "rank", "cet", "marks"}
+    # --- Tier 1: Cutoff Search (Highly specific RAG) ---
+    admission_keywords = {"cutoff", "cut off", "rank", "cet", "marks", "admission", "percentile"}
     if any(word in q_lower for word in admission_keywords):
         cutoff_answer = search_cutoff_embeddings(q)
         if cutoff_answer:
             hist = HISTORY.get(session_id, [])
             hist.append({"q": q, "a": cutoff_answer})
-            HISTORY[session_id] = hist[-10:]
+            HISTORY[session_id] = hist[-10:] # Keep last 10 entries
             return jsonify({"answer": cutoff_answer, "retrieved": [], "history": HISTORY[session_id]})
 
+    # --- Tier 2: JSON Q&A (Exact match / high-confidence fixed answers) ---
     json_answer = search_json_embeddings(q)
     if json_answer:
         hist = HISTORY.get(session_id, [])
@@ -256,21 +299,28 @@ def api_query():
         HISTORY[session_id] = hist[-10:]
         return jsonify({"answer": json_answer, "retrieved": [], "history": HISTORY[session_id]})
 
+    # --- Tier 3: Main RAG and LLM Generation ---
     try:
         retrieved = retrieve(q, top_k=3)
     except Exception as e:
         logger.exception("Retrieval failed: %s", e)
-        return jsonify({"error": f"Retrieval failed: {str(e)}"}), 500
+        # Continue even if retrieval fails, LLM might be able to answer generally
+        retrieved = []
 
     hist = HISTORY.get(session_id, [])
     system, user_prompt = build_prompt(q, retrieved, hist)
 
     try:
+        # Note: groq_client.py must be available in the environment
         from groq_client import groq_generate_async  # custom async Groq client
+        # Safely run the async Groq call
         answer = run_async(groq_generate_async(system, user_prompt, max_tokens=300, temperature=0.1))
+    except ImportError:
+        logger.error("groq_client not found. Cannot generate LLM answer.")
+        answer = "I apologize, the language model is currently unavailable for complex queries."
     except Exception as e:
         logger.error("Groq API error: %s", e)
-        return jsonify({"error": "Groq API error"}), 502
+        answer = "I'm having trouble connecting to the AI brain right now. Please try again."
 
     hist.append({"q": q, "a": answer})
     HISTORY[session_id] = hist[-10:]
@@ -294,20 +344,23 @@ def api_health():
     })
 
 
+# ================== Static File Serving ==================
 @app.route("/")
 def frontend_index():
+    # Serves the index.html from the configured static_folder (../frontend)
     return send_from_directory(app.static_folder, "index.html")
 
 
 @app.route("/<path:path>")
 def static_proxy(path):
+    # Serves other static files (like CSS, JS, images) from the configured static_folder
     return send_from_directory(app.static_folder, path)
 
 
 if __name__ == "__main__":
     import os
 
-    # Host stays 0.0.0.0 for external access
+    # Host stays 0.0.0.0 for external access in containerized environments
     host = os.getenv("FLASK_HOST", "0.0.0.0")
 
     # Local dev port defaults to 5000 or FLASK_PORT if set
