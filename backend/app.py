@@ -364,7 +364,7 @@ if __name__ == "__main__":
     host = os.getenv("FLASK_HOST", "0.0.0.0")
 
     # Local dev port defaults to 5000 or FLASK_PORT if set
-    port = int(os.getenv("FLASK_PORT", 5000))
+    port = int(os.getenv("FLASK_PORT", 8081))
 
     # Only enable debug locally
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
